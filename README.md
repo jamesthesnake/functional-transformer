@@ -1,4 +1,4 @@
-A fully functional (pun intended) implementation of a machine learning transformer model in Python/JAX.  I do realize that 'pure functional' and 'Python' are not necessarily mots quit vont tres bien ensemble, but I'm sure you'll agree on reading the code that it has [una anima di pura programmazione funzionale](https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html).  And a little [macaronica](https://en.wikipedia.org/wiki/Macaronic_language) appeals to the peasant soul.  In other words, don't worry about the language... 
+A fully functional (pun intended) implementation of a machine learning transformer model in Python/JAX.  I do realize that 'pure functional' and 'Python' are not necessarily [mots quit vont très bien ensemble](https://forum.wordreference.com/threads/sont-les-mots-qui-vont-tr%C3%A8s-bien-ensemble.1832510/), but I'm sure you'll agree on reading the code that it has [una anima di pura programmazione funzionale](https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html).  And a little [macaronica](https://en.wikipedia.org/wiki/Macaronic_language) appeals to the peasant soul.  In other words, don't worry about the language... 
 
 Given only a few simple BLAS-like functions:
 ```python
@@ -29,7 +29,7 @@ def transformer(cfg, params, x: jnp.ndarray):
     # Start with token embeddings
     embeddings = cfg.lambda_e * params.embeddings[x, :]     # L x Dm
 
-    # Add positional encodings
+    # Add (learned) positional encodings
     embeddings += cfg.lambda_pe * params.positional_encodings[:L, :]
 
     # Apply the transformer layers
@@ -45,11 +45,12 @@ def transformer(cfg, params, x: jnp.ndarray):
             # Project into this head's query/key space
             query = linear(head.query, t1)                  # L x Dk
             key = linear(head.key, t1)                      # L x Dk
-            value = linear(head.value, t1)                  # L x Dm
 
+            # Compute L x L attention matrix
             score = query @ key.T + mask                    # L x L
             attn = jax.nn.softmax(cfg.tau * score, axis=1)  # L x L
 
+            value = linear(head.value, t1)                  # L x Dm
             self_attn = attn @ value                        # L x Dm
 
             # Add this head's contribution into embeddings
@@ -80,17 +81,16 @@ The loss and its gradient needs a few more lines:
 def crossentropy(output: jnp.ndarray, target: int):
     return -jax.nn.log_softmax(output)[target]
 
-def loss(cfg, params, x):
-    output = transformer(cfg, params, x)
-    xent = vmap(crossentropy)(output[:-1], x[1:])
-    return xent.mean()
+def seq_crossentropy(output: jnp.ndarray, targets: jnp.ndarray):
+    return vmap(crossentropy)(output, targets).mean()
 
-def loss_batch(cfg, params, seq):
-    batched = vmap(loss, in_axes=(None, None, 0), out_axes=0)
-    return jnp.mean(batched(cfg, params, seq))
+def transformer_loss(cfg, params, x):
+    output = transformer(cfg, params, x)
+
+    return seq_crossentropy(output[:-1], x[1:])
 
 # Gradient wrt 'params'
-grad_loss_batch = jax.grad(loss_batch, argnums=1)
+grad_loss = jax.grad(transformer_loss, argnums=1)
 ```
 
 The random initialization is also short:
@@ -145,4 +145,5 @@ Results at https://wandb.ai/awfidius/pure-transformer
 
 ## Acknowledgements
 
-The model is based on https://github.com/vpj/jax_transformer/blob/master/transformer.py, and the Adam and Dataset classes are almost direct copies from https://github.com/vpj/jax_transformer
+The model is based on https://github.com/vpj/jax_transformer/blob/master/transformer.py, and the Adam and Dataset 
+classes in jaxutils are almost direct copies from https://github.com/vpj/jax_transformer

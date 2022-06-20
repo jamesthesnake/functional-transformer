@@ -9,7 +9,7 @@ import jax
 from jax import vmap
 import jax.numpy as jnp
 
-import matplotlib.pyplot as plt
+from functools import partial
 
 import jax.experimental.host_callback
 
@@ -32,18 +32,6 @@ def rand(rng, f, shape, **kwargs):
     return rng, f(rng1, shape, **kwargs)
 
 
-# Linear layer Wx + b
-def Linear_init0(rng: jax.random.KeyArray, in_features: int, out_features: int):
-    params = ParamsDict()
-    rnd_range = 1 / in_features**0.5
-    params.weight = jax.random.uniform(
-        rng, (in_features, out_features), minval=-rnd_range, maxval=rnd_range
-    )
-
-    params.bias = jnp.zeros((out_features,))
-    return params
-
-
 def linear_init_uniform(rng: jax.random.KeyArray, in_features: int, out_features: int):
     """
     Initialize a linear layer with uniform weights and zero bias
@@ -63,31 +51,11 @@ def linear_init_uniform(rng: jax.random.KeyArray, in_features: int, out_features
 
 
 # Layer norm
-def layernorm_init_identity(shape):
+def elementwise_linear_init_identity(shape):
     """
     Initialize an elementwise_linear layer with unit gain, zero bias
     """
     return ParamsDict(gain=jnp.ones(shape), bias=jnp.zeros(shape))
-
-
-def linear_with_commented_shapes(params, x: jnp.ndarray):
-    return jnp.matmul(x, params.weight) + params.bias[None, :]
-    #                 L x N, N x M        |- 1 x M -|
-    #      |----- L x M --------------|   |- ? x M ---------|
-
-
-def center_commented(x, eps: float = 1e-5):
-    """
-    Return (x - mean(x))/std(x)
-
-    """
-    assert len(x.shape) == 1  # Used only on vectors in this example
-    x_centered = x - x.mean()
-    var = (x_centered**2).mean()
-    return x_centered / jnp.sqrt(var + eps)
-
-
-# Compact primitives for 'all on one slide'
 
 
 def linear(params, x: jnp.ndarray):
@@ -98,7 +66,7 @@ def elementwise_linear(params, x: jnp.ndarray):
     return params.gain[None, :] * x + params.bias[None, :]
 
 
-def center(x, eps=1e-5):
+def standardize(x, eps=1e-5):
     return (x - x.mean()) / (x.std() + eps)
 
 
@@ -140,7 +108,7 @@ def transformer_init(
     params.layers = []
     for _ in range(n_layers):
         layer = ParamsDict()
-        layer.norm_self_attn = layernorm_init_identity(d_model)
+        layer.norm_self_attn = elementwise_linear_init_identity(d_model)
 
         layer.heads = []
         for _ in range(n_heads):
@@ -151,7 +119,7 @@ def transformer_init(
 
             layer.heads.append(head)
 
-        layer.norm_ff = layernorm_init_identity(d_model)
+        layer.norm_ff = elementwise_linear_init_identity(d_model)
 
         rng, layer.ffn1 = linear_init_uniform(rng, d_model, d_ff)
         rng, layer.ffn2 = linear_init_uniform(rng, d_ff, d_model)
@@ -159,7 +127,7 @@ def transformer_init(
         params.layers.append(layer)
 
     # Final normalization and output layer
-    params.pre_output_norm = layernorm_init_identity(d_model)
+    params.pre_output_norm = elementwise_linear_init_identity(d_model)
     rng, params.output = linear_init_uniform(rng, d_model, n_vocab)
 
     return rng, config, params
@@ -167,6 +135,7 @@ def transformer_init(
 
 # Format off for the size annotations
 # fmt: off
+@partial(jax.jit, static_argnums=0)
 def transformer(cfg, params, x: jnp.ndarray):
     """
     cfg: Config, from transformer_init, holds hyperparameters
@@ -183,14 +152,14 @@ def transformer(cfg, params, x: jnp.ndarray):
     # Start with token embeddings
     embeddings = cfg.lambda_e * params.embeddings[x, :]     # L x Dm
 
-    # Add positional encodings
+    # Add (learned) positional encodings
     embeddings += cfg.lambda_pe * params.positional_encodings[:L, :]
 
     # Apply the transformer layers
     for layer in params.layers:
 
         # Layer-normalize embeddings
-        t1 = vmap(center)(embeddings)
+        t1 = vmap(standardize)(embeddings)
         t1 = elementwise_linear(layer.norm_self_attn, t1)   # L x Dm
 
         # Multi-head self-attention
@@ -199,18 +168,19 @@ def transformer(cfg, params, x: jnp.ndarray):
             # Project into this head's query/key space
             query = linear(head.query, t1)                  # L x Dk
             key = linear(head.key, t1)                      # L x Dk
-            value = linear(head.value, t1)                  # L x Dm
 
+            # Compute L x L attention matrix
             score = query @ key.T + mask                    # L x L
             attn = jax.nn.softmax(cfg.tau * score, axis=1)  # L x L
 
+            value = linear(head.value, t1)                  # L x Dm
             self_attn = attn @ value                        # L x Dm
 
             # Add this head's contribution into embeddings
             embeddings += self_attn                         # L x Dm
 
         # Layer-normalize embeddings
-        t2 = vmap(center)(embeddings)
+        t2 = vmap(standardize)(embeddings)
         t2 = elementwise_linear(layer.norm_ff, t2)          # L x Dm
 
         # Feedforward fully connected
@@ -222,12 +192,20 @@ def transformer(cfg, params, x: jnp.ndarray):
         embeddings += t2
 
     # Layer-normalize embeddings
-    embeddings = vmap(center)(embeddings)
+    embeddings = vmap(standardize)(embeddings)
     embeddings = elementwise_linear(params.pre_output_norm, embeddings)
 
     # And linearly project to output dimension
     return linear(params.output, embeddings)                # L x n_vocab 
 # fmt: on
+
+
+def crossentropy(output: jnp.ndarray, target: int):
+    return -jax.nn.log_softmax(output)[target]
+
+
+def seq_crossentropy(output: jnp.ndarray, targets: jnp.ndarray):
+    return vmap(crossentropy)(output, targets).mean()
 
 
 def transformer_loss(cfg, params, x):
@@ -243,32 +221,10 @@ def transformer_loss(cfg, params, x):
     return seq_crossentropy(output[:-1], x[1:])
 
 
-def crossentropy(output: jnp.ndarray, target: int):
-    return -jax.nn.log_softmax(output)[target]
+# We don't jit this, as the loop will unroll, and take a long time to compile
+def transformer_sample(cfg, params, seq: jnp.ndarray, length: int = 20):
 
-
-def seq_crossentropy(output: jnp.ndarray, targets: jnp.ndarray):
-    return vmap(crossentropy)(output, targets).mean()
-
-
-def crossentropy(output: jnp.ndarray, target: int):
-    return -jax.nn.log_softmax(output)[target]
-
-
-def loss(cfg, params, x):
-    output = transformer(cfg, params, x)
-    xent = vmap(crossentropy)(output[:-1], x[1:])
-    return xent.mean()
-
-
-def loss_batch(cfg, params, seq):
-    batched = vmap(loss, in_axes=(None, None, 0), out_axes=0)
-    return jnp.mean(batched(cfg, params, seq))
-
-
-def transformer_sample_unjit(cfg, params, seq: jnp.ndarray, length: int = 20):
-
-    for i in range(length):
+    for _i in range(length):
         output = transformer(cfg, params, seq)
 
         idx = jnp.argmax(output[-1])
